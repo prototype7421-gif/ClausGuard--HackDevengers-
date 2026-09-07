@@ -1,9 +1,6 @@
-import fs from "fs";
 import path from "path";
-import { createRequire } from "module";
 import { pathToFileURL } from "url";
-import { PDFParse } from "pdf-parse";
-import { createWorker } from "tesseract.js";
+import { createRequire } from "module";
 
 export interface PdfExtractResult {
   text: string;
@@ -12,83 +9,73 @@ export interface PdfExtractResult {
 }
 
 const MIN_USEFUL_CHARS = 20;
-const MAX_OCR_PAGES = 15;
+const MAX_OCR_PAGES = 10;
 const MAX_TEXT_CHARS = 50000;
 
-// Resolve from project root — safe in Next.js server bundles (no __filename)
-const require = createRequire(path.join(process.cwd(), "package.json"));
+// Use createRequire so Next.js always resolves to the CJS Node build,
+// regardless of whether the server bundle is compiled as ESM or CJS.
+const nodeRequire = createRequire(path.join(process.cwd(), "package.json"));
+
+type PDFParseClass = {
+  new (opts: { data: Uint8Array }): PDFParseInstance;
+  setWorker: (src: string) => void;
+};
+
+type PDFParseInstance = {
+  getText: () => Promise<{ total?: number; pages?: { text?: string }[] }>;
+  getInfo: () => Promise<{ total?: number }>;
+  destroy: () => Promise<void>;
+};
 
 let workerConfigured = false;
 
-/**
- * Point pdf.js at a real worker file on disk.
- * Next.js production builds otherwise look for pdf.worker.mjs inside
- * `.next/server/chunks` and fail with "Cannot find module pdf.worker.mjs".
- */
-function ensurePdfWorker() {
+function getPDFParse(): PDFParseClass {
+  const mod: any = nodeRequire("pdf-parse");  
+  const PDFParse: PDFParseClass = mod.PDFParse ?? mod.default?.PDFParse ?? mod;
+  if (typeof PDFParse !== "function") {
+    throw new Error("pdf-parse: PDFParse constructor not found");
+  }
+  return PDFParse;
+}
+
+function ensurePdfWorker(PDFParse: PDFParseClass) {
   if (workerConfigured) return;
 
-  const candidates: string[] = [];
-
-  const tryResolve = (id: string) => {
-    try {
-      candidates.push(require.resolve(id));
-    } catch {
-      // ignore
-    }
-  };
-
-  tryResolve("pdf-parse/dist/worker/pdf.worker.mjs");
-  tryResolve("pdf-parse/dist/pdf-parse/cjs/pdf.worker.mjs");
-  tryResolve("pdfjs-dist/legacy/build/pdf.worker.mjs");
-  tryResolve("pdfjs-dist/build/pdf.worker.min.mjs");
-  tryResolve("pdfjs-dist/build/pdf.worker.mjs");
-
-  candidates.push(
+  const candidates = [
     path.join(process.cwd(), "node_modules/pdf-parse/dist/worker/pdf.worker.mjs"),
-    path.join(
-      process.cwd(),
-      "node_modules/pdf-parse/dist/pdf-parse/cjs/pdf.worker.mjs"
-    ),
-    path.join(
-      process.cwd(),
-      "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"
-    ),
-    path.join(
-      process.cwd(),
-      "node_modules/pdfjs-dist/build/pdf.worker.min.mjs"
-    )
-  );
+    path.join(process.cwd(), "node_modules/pdf-parse/dist/pdf-parse/cjs/pdf.worker.mjs"),
+    path.join(process.cwd(), "node_modules/pdf-parse/dist/pdf-parse/esm/pdf.worker.mjs"),
+    path.join(process.cwd(), "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"),
+    path.join(process.cwd(), "node_modules/pdfjs-dist/build/pdf.worker.min.mjs"),
+    path.join(process.cwd(), "node_modules/pdfjs-dist/build/pdf.worker.mjs"),
+  ];
+
+   
+  const fs = require("fs") as typeof import("fs");
 
   const workerPath = candidates.find((p) => {
     try {
-      return typeof p === "string" && fs.existsSync(p);
+      return fs.existsSync(p);
     } catch {
       return false;
     }
   });
 
-  if (!workerPath) {
-    throw new Error(
-      "PDF worker file not found. Ensure pdf-parse / pdfjs-dist are installed."
-    );
+  if (workerPath) {
+    try {
+      PDFParse.setWorker(pathToFileURL(path.resolve(workerPath)).href);
+    } catch {
+      // setWorker failure is non-fatal; pdf-parse may auto-discover the worker
+    }
   }
 
-  // Absolute file:// URL is the most reliable for Node ESM worker loading
-  const workerSrc = pathToFileURL(path.resolve(workerPath)).href;
-  PDFParse.setWorker(workerSrc);
   workerConfigured = true;
 }
 
-function createParser(buffer: Buffer) {
-  ensurePdfWorker();
-  return new PDFParse({ data: new Uint8Array(buffer) });
-}
-
 /**
- * Extract readable text from any PDF.
+ * Extract readable text from any PDF buffer.
  * 1) Try embedded text layer first
- * 2) If little/no text (scanned/image PDF), render pages and OCR them
+ * 2) If little/no text (scanned/image PDF), OCR via tesseract.js
  */
 export async function extractTextFromPdf(
   buffer: Buffer
@@ -96,9 +83,12 @@ export async function extractTextFromPdf(
   let textLayer = "";
   let pages = 0;
 
+  const PDFParse = getPDFParse();
+  ensurePdfWorker(PDFParse);
+
   // ── Step 1: embedded text ──
   try {
-    const parser = createParser(buffer);
+    const parser = new PDFParse({ data: new Uint8Array(buffer) });
     try {
       const result = await parser.getText();
       pages = result.total ?? 0;
@@ -108,7 +98,11 @@ export async function extractTextFromPdf(
         .join("\n\n")
         .trim();
     } finally {
-      await parser.destroy();
+      try {
+        await parser.destroy();
+      } catch {
+        // ignore
+      }
     }
   } catch (err) {
     console.warn("PDF text extraction failed, will try OCR:", err);
@@ -123,8 +117,13 @@ export async function extractTextFromPdf(
     };
   }
 
-  // ── Step 2: OCR via page screenshots ──
-  const ocrText = await ocrPdfPages(buffer, pages || MAX_OCR_PAGES);
+  // ── Step 2: OCR via tesseract ──
+  let ocrText = "";
+  try {
+    ocrText = await ocrPdfPages(buffer, pages || MAX_OCR_PAGES, PDFParse);
+  } catch (ocrErr) {
+    console.warn("OCR failed:", ocrErr);
+  }
 
   const combined = [textLayer, ocrText]
     .filter((t) => t && t.trim().length > 0)
@@ -146,50 +145,76 @@ export async function extractTextFromPdf(
 
 async function ocrPdfPages(
   buffer: Buffer,
-  totalPagesHint: number
+  totalPagesHint: number,
+  PDFParse: PDFParseClass
 ): Promise<string> {
-  const parser = createParser(buffer);
+   
+  const { createWorker } = require("tesseract.js") as typeof import("tesseract.js");
+
+  const parser = new PDFParse({ data: new Uint8Array(buffer) });
 
   try {
-    const info = await parser.getInfo();
-    const totalPages = Math.min(
-      info.total || totalPagesHint || 1,
-      MAX_OCR_PAGES
-    );
-
-    const screenshot = await parser.getScreenshot({
-      scale: 2,
-      imageBuffer: true,
-      imageDataUrl: false,
-      partial: Array.from({ length: totalPages }, (_, i) => i + 1),
-    });
-
-    const pageImages: Uint8Array[] = (screenshot.pages || [])
-      .map((p: { data?: Uint8Array }) => p.data)
-      .filter(
-        (d: Uint8Array | undefined): d is Uint8Array => !!d && d.length > 0
-      );
-
-    if (pageImages.length === 0) {
-      return await ocrEmbeddedImages(parser);
+    let totalPages = totalPagesHint;
+    try {
+      const info = await parser.getInfo();
+      totalPages = Math.min(info.total || totalPagesHint || 1, MAX_OCR_PAGES);
+    } catch {
+      totalPages = Math.min(totalPagesHint || 1, MAX_OCR_PAGES);
     }
+
+    // Try page screenshots first
+    let pageImages: Uint8Array[] = [];
+    try {
+      const screenshot = await (parser as any).getScreenshot({  
+        scale: 2,
+        imageBuffer: true,
+        imageDataUrl: false,
+        partial: Array.from({ length: totalPages }, (_, i) => i + 1),
+      });
+      pageImages = (screenshot.pages || [])
+        .map((p: { data?: Uint8Array }) => p.data)
+        .filter(
+          (d: Uint8Array | undefined): d is Uint8Array => !!d && d.length > 0
+        );
+    } catch {
+      // getScreenshot not supported or failed — fall through to embedded images
+    }
+
+    // Fall back to embedded images if no screenshots
+    if (pageImages.length === 0) {
+      try {
+        const imagesResult = await (parser as any).getImage({});  
+        for (const page of imagesResult.pages || []) {
+          for (const img of page.images || []) {
+            const maybe = img as { data?: Uint8Array };
+            if (maybe.data instanceof Uint8Array && maybe.data.length > 0) {
+              pageImages.push(maybe.data);
+              if (pageImages.length >= MAX_OCR_PAGES) break;
+            }
+          }
+          if (pageImages.length >= MAX_OCR_PAGES) break;
+        }
+      } catch {
+        // No embedded images either
+      }
+    }
+
+    if (pageImages.length === 0) return "";
 
     const worker = await createWorker("eng");
     const pageTexts: string[] = [];
 
     try {
-      for (let i = 0; i < pageImages.length; i++) {
-        const img = pageImages[i];
+      const limit = Math.min(pageImages.length, MAX_OCR_PAGES);
+      for (let i = 0; i < limit; i++) {
         const {
           data: { text },
-        } = await worker.recognize(Buffer.from(img));
+        } = await worker.recognize(Buffer.from(pageImages[i]));
         const cleaned = (text || "").trim();
-        if (cleaned) {
-          pageTexts.push(cleaned);
-        }
+        if (cleaned) pageTexts.push(cleaned);
       }
     } finally {
-      await worker.terminate();
+      await worker.terminate().catch(() => {});
     }
 
     return pageTexts.join("\n\n").trim();
@@ -199,44 +224,5 @@ async function ocrPdfPages(
     } catch {
       // ignore
     }
-  }
-}
-
-async function ocrEmbeddedImages(
-  parser: InstanceType<typeof PDFParse>
-): Promise<string> {
-  try {
-    const imagesResult = await parser.getImage({});
-    const images: Uint8Array[] = [];
-
-    for (const page of imagesResult.pages || []) {
-      for (const img of page.images || []) {
-        const maybe = img as { data?: Uint8Array };
-        if (maybe.data instanceof Uint8Array && maybe.data.length > 0) {
-          images.push(maybe.data);
-        }
-      }
-    }
-
-    if (images.length === 0) return "";
-
-    const worker = await createWorker("eng");
-    const texts: string[] = [];
-    try {
-      const limit = Math.min(images.length, MAX_OCR_PAGES);
-      for (let i = 0; i < limit; i++) {
-        const {
-          data: { text },
-        } = await worker.recognize(Buffer.from(images[i]));
-        const cleaned = (text || "").trim();
-        if (cleaned) texts.push(cleaned);
-      }
-    } finally {
-      await worker.terminate();
-    }
-    return texts.join("\n\n").trim();
-  } catch (err) {
-    console.warn("Embedded image OCR failed:", err);
-    return "";
   }
 }

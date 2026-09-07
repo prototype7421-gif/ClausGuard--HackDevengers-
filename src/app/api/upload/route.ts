@@ -5,6 +5,14 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
+// Allow up to 25MB multipart bodies (Next.js default is 4MB)
+export const config = {
+  api: {
+    bodyParser: false,
+    sizeLimit: "25mb",
+  },
+};
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
@@ -48,7 +56,8 @@ export async function POST(request: NextRequest) {
         err instanceof Error
           ? err.message
           : "Could not read the PDF. Please try another file or paste the text instead.";
-      return NextResponse.json({ error: message }, { status: 400 });
+      console.error("PDF extraction error:", err);
+      return NextResponse.json({ error: message }, { status: 422 });
     }
 
     return NextResponse.json({
@@ -59,9 +68,10 @@ export async function POST(request: NextRequest) {
       method: extracted.method,
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     console.error("PDF upload error:", error);
     return NextResponse.json(
-      { error: "Failed to process the PDF. Please try again." },
+      { error: `Failed to process the PDF: ${message}` },
       { status: 500 }
     );
   }

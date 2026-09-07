@@ -124,8 +124,9 @@ export default function AnalyzerClient() {
         charCount: data.charCount,
         method: data.method,
       });
-    } catch {
-      setError("Network error uploading PDF. Please try again.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`Network error uploading PDF: ${msg}`);
     } finally {
       setUploading(false);
     }
