@@ -75,13 +75,17 @@ export default function ChatBot() {
     return "Great question! You can upload any document to ClauseGuard and I'll analyze it for hidden risks. Try pasting contract text or uploading a PDF. Is there something specific you'd like help with?";
   };
 
-  const handleSend = async (content: string = input) => {
-    if (!content.trim()) return;
+  const messageIdRef = useRef(0);
 
+  const handleSend = (content?: string) => {
+    const text = (content ?? input).trim();
+    if (!text) return;
+
+    messageIdRef.current += 1;
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: `user-${messageIdRef.current}`,
       role: "user",
-      content: content.trim(),
+      content: text,
     };
 
     setMessages((prev) => [...prev, userMessage]);
@@ -90,14 +94,15 @@ export default function ChatBot() {
 
     // Simulate AI thinking time
     setTimeout(() => {
+      messageIdRef.current += 1;
       const response: Message = {
-        id: (Date.now() + 1).toString(),
+        id: `bot-${messageIdRef.current}`,
         role: "assistant",
         content: generateResponse(userMessage.content),
       };
       setMessages((prev) => [...prev, response]);
       setIsTyping(false);
-    }, 600 + Math.random() * 400);
+    }, 800);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

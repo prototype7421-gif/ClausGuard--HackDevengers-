@@ -126,6 +126,119 @@ function normalizeResult(raw: Record<string, unknown>, fallbackText: string) {
   };
 }
 
+async function callGemini(apiKey: string, text: string) {
+  const candidateModels = [
+    process.env.GEMINI_MODEL,
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+  ].filter(Boolean) as string[];
+
+  const models = Array.from(new Set(candidateModels));
+  let lastError: unknown;
+
+  for (const model of models) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: `Analyze this document (any type is fine):\n\n${text.slice(0, 30000)}`,
+                  },
+                ],
+              },
+            ],
+            systemInstruction: {
+              parts: [{ text: SYSTEM_PROMPT }],
+            },
+            generationConfig: {
+              temperature: 0.2,
+              maxOutputTokens: 4096,
+              responseMimeType: "application/json",
+            },
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`Gemini API error [${model}, HTTP ${response.status}]:`, errorText);
+        if (response.status === 404 && models.indexOf(model) < models.length - 1) {
+          // Model not found for this key/version, try next fallback model
+          continue;
+        }
+        throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
+      }
+
+      const data = await response.json();
+      const content = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!content) {
+        throw new Error("No text content returned from Gemini API");
+      }
+
+      let jsonStr = content.trim();
+      if (jsonStr.startsWith("```")) {
+        jsonStr = jsonStr
+          .replace(/^```(?:json)?\n?/, "")
+          .replace(/\n?```$/, "");
+      }
+
+      return JSON.parse(jsonStr);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error("Failed to get response from Gemini API");
+}
+
+async function callOpenAI(apiKey: string, text: string) {
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: `Analyze this document (any type is fine):\n\n${text.slice(0, 20000)}`,
+        },
+      ],
+      temperature: 0.3,
+      max_tokens: 4000,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenAI API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error("No content in OpenAI response");
+
+  let jsonStr = content.trim();
+  if (jsonStr.startsWith("```")) {
+    jsonStr = jsonStr
+      .replace(/^```(?:json)?\n?/, "")
+      .replace(/\n?```$/, "");
+  }
+
+  return JSON.parse(jsonStr);
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -143,101 +256,86 @@ export async function POST(request: NextRequest) {
 
     const cleaned = text.trim().slice(0, 50000);
 
-    if (!db) {
-      const result = getDemoAnalysis(cleaned);
-
-      return NextResponse.json({
-        id: "demo",
-        riskScore: result.risk_score,
-        summary: result.summary,
-        redFlags: result.red_flags,
-        documentType: result.document_type,
-        status: "completed",
-      });
+    // Optional DB tracking: insert record if database is configured
+    let recordId: string | undefined;
+    if (db) {
+      try {
+        const [record] = await db
+          .insert(analyses)
+          .values({
+            inputText: cleaned,
+            status: "processing",
+          })
+          .returning();
+        if (record?.id) {
+          recordId = record.id;
+        }
+      } catch (dbErr) {
+        console.warn("DB insert skipped or failed (continuing analysis):", dbErr);
+      }
     }
 
-    // Insert the analysis record
-    const [record] = await db
-      .insert(analyses)
-      .values({
-        inputText: cleaned,
-        status: "processing",
-      })
-      .returning();
-
     let result;
+    const geminiApiKey =
+      process.env.GEMINI_API_KEY ||
+      process.env.GOOGLE_API_KEY ||
+      process.env.GOOGLE_GENAI_API_KEY;
+    const openaiApiKey = process.env.OPENAI_API_KEY;
 
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (apiKey) {
+    if (geminiApiKey) {
       try {
-        const response = await fetch(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify({
-              model: "gpt-4o-mini",
-              messages: [
-                { role: "system", content: SYSTEM_PROMPT },
-                {
-                  role: "user",
-                  content: `Analyze this document (any type is fine):\n\n${cleaned.slice(0, 20000)}`,
-                },
-              ],
-              temperature: 0.3,
-              max_tokens: 4000,
-            }),
-          }
-        );
-
-        if (!response.ok) {
-          throw new Error(`OpenAI API error: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content;
-
-        if (!content) throw new Error("No content in response");
-
-        let jsonStr = content.trim();
-        if (jsonStr.startsWith("```")) {
-          jsonStr = jsonStr
-            .replace(/^```(?:json)?\n?/, "")
-            .replace(/\n?```$/, "");
-        }
-
-        result = normalizeResult(JSON.parse(jsonStr), cleaned);
-      } catch {
+        const rawJson = await callGemini(geminiApiKey, cleaned);
+        result = normalizeResult(rawJson, cleaned);
+      } catch (geminiErr) {
+        console.error("Gemini analysis failed, falling back to demo:", geminiErr);
+        result = getDemoAnalysis(cleaned);
+      }
+    } else if (openaiApiKey) {
+      try {
+        const rawJson = await callOpenAI(openaiApiKey, cleaned);
+        result = normalizeResult(rawJson, cleaned);
+      } catch (openaiErr) {
+        console.error("OpenAI analysis failed, falling back to demo:", openaiErr);
         result = getDemoAnalysis(cleaned);
       }
     } else {
       result = getDemoAnalysis(cleaned);
     }
 
-    const [updated] = await db
-      .update(analyses)
-      .set({
-        riskScore: result.risk_score,
-        summary: result.summary,
-        redFlags: result.red_flags,
-        status: "completed",
-      })
-      .where(eq(analyses.id, record.id))
-      .returning();
+    // If DB is available and record was inserted, update it
+    if (db && recordId) {
+      try {
+        const [updated] = await db
+          .update(analyses)
+          .set({
+            riskScore: result.risk_score,
+            summary: result.summary,
+            redFlags: result.red_flags,
+            status: "completed",
+          })
+          .where(eq(analyses.id, recordId))
+          .returning();
+
+        return NextResponse.json({
+          id: updated.id,
+          riskScore: updated.riskScore,
+          summary: updated.summary,
+          redFlags: updated.redFlags,
+          documentType: result.document_type,
+          status: updated.status,
+        });
+      } catch (dbErr) {
+        console.warn("DB update failed, returning result directly:", dbErr);
+      }
+    }
 
     return NextResponse.json({
-      id: updated.id,
-      riskScore: updated.riskScore,
-      summary: updated.summary,
-      redFlags: updated.redFlags,
-      documentType:
-        "document_type" in result
-          ? (result as { document_type?: string }).document_type
-          : undefined,
-      status: updated.status,
+      id: recordId || "demo",
+      riskScore: result.risk_score,
+      summary: result.summary,
+      redFlags: result.red_flags,
+      documentType: result.document_type,
+      status: "completed",
     });
   } catch (error) {
     console.error("Analysis error:", error);
